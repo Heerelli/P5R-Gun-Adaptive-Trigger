@@ -280,7 +280,6 @@ struct ShotRec {
 };
 static ShotRec g_ring[kRingSize];
 static std::atomic<uint32_t> g_head{ 0 };
-static HANDLE g_wake;
 static std::atomic<uint32_t> g_hookHits{ 0 };
 
 // No C++ objects here: __try needs a frame without unwinding.
