@@ -1,0 +1,21 @@
+{
+  "ModId": "p5rpc.gun.adaptivetrigger",
+  "ModName": "P5R Gun Adaptive Trigger",
+  "ModAuthor": "Heerelli",
+  "ModVersion": "0.1.0",
+  "ModDescription": "전투에서 총을 쏠 때 캐릭터별 듀얼센스 적응형 트리거 효과를 냅니다. 다른 모드나 외부 앱 없이 동작합니다 (USB/블루투스).",
+  "ModDll": "",
+  "ModIcon": "",
+  "ModR2RManagedDll32": "",
+  "ModR2RManagedDll64": "",
+  "ModNativeDll32": "",
+  "ModNativeDll64": "P5RGunTrigger.dll",
+  "IsLibrary": false,
+  "ReleaseMetadataFileName": "",
+  "PluginData": {},
+  "IsUniversalMod": false,
+  "ModDependencies": [],
+  "OptionalDependencies": [],
+  "SupportedAppId": [ "p5r.exe" ],
+  "ProjectUrl": "https://github.com/Heerelli/P5R-Gun-Adaptive-Trigger"
+}
