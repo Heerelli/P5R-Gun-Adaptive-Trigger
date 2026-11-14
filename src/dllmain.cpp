@@ -2,7 +2,8 @@
 // ---------------------------------------------------------------------------
 // Every gun shot in battle spends one bullet. The mod hooks that instruction
 // (see hookstub.h), works out who fired, and plays that character's
-// adaptive-trigger effect on a DualSense by writing HID output reports itself.
+// adaptive-trigger effect and haptic recoil on a DualSense by itself.
+// While aiming (D-pad Up), R2 fires instead of Cross (see inputhook.cpp).
 //
 //   P5R.exe  dec ax / mov [r15+79D0h],ax ──► stub ──► OnShot(unit, bullets)
 //                                                        │  (ring buffer)
@@ -10,17 +11,16 @@
 //                                         worker thread: who fired? → profile
 //                                                        │
 //                                                        ▼
-//                              DualSense HID output report (trigger flags only)
+//                 DualSense HID output report (trigger flags only) + USB haptics
+//
+//   game pad input ──► inputhook.cpp: aiming? R2 → Cross ──► worker: aim effect on R2
 //
 // No other mod, library or app is needed: Reloaded-II only loads the DLL.
 // ---------------------------------------------------------------------------
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "common.h"
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,8 +32,6 @@
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "user32.lib")
 
-#define MOD_VERSION "0.1.0"
-
 // ───────────────────────────── characters ─────────────────────────────
 // P5R party unit ids (1-10). 0 = unknown shooter -> [Default].
 static const char* kSection[11] = { "Default", "Joker", "Skull", "Mona", "Panther", "Fox", "Queen", "Noir", "Oracle", "Crow", "Violet" };
@@ -41,7 +39,8 @@ static const char* kSection[11] = { "Default", "Joker", "Skull", "Mona", "Panthe
 struct Profile {
     ds::Effect kick;   // played the moment the shot happens
     int kickMs;
-    ds::Effect rest;   // held afterwards until HoldMs of no shots
+    ds::Effect rest;   // held afterwards while still aiming (or HoldMs)
+    double haptic;     // haptic recoil gain for this character (0 = none)
 };
 
 // Defaults (same as P5RGunTrigger.ini in the repo).
@@ -63,12 +62,16 @@ static const ProfileText kDefaults[11] = {
 // ───────────────────────────── globals / config ─────────────────────────────
 static HMODULE g_self;
 static wchar_t g_dir[MAX_PATH], g_ini[MAX_PATH], g_logPath[MAX_PATH];
-static std::atomic<bool> g_quit{ false };
+std::atomic<bool> g_quit{ false };
+HANDLE g_wake;
+static SRWLOCK g_logLock = SRWLOCK_INIT;
 
 static struct Config {
     bool enabled = true;
     bool right = true, left = false;  // Trigger=R2 / L2 / Both
-    int holdMs = 2500;                // keep the "rest" effect this long after the last shot
+    int holdMs = 2500;                // keep the "rest" effect this long after the last shot (when aiming is unknown)
+    int aimReleaseMs = 150;           // after aiming ends, release the trigger this much later
+    ds::Effect aim;                   // on R2 while aiming, before the first shot
     int refreshMs = 400;              // re-send the active effect (in case something overwrote it)
     bool muteUnfocused = true;
     bool hotkeys = true;
@@ -80,19 +83,21 @@ static struct Config {
 } g_cfg;
 static Profile g_profiles[11];
 
-static void Log(const char* fmt, ...) {
+void Log(const char* fmt, ...) {
     char msg[1024];
     va_list ap; va_start(ap, fmt); _vsnprintf_s(msg, sizeof msg, _TRUNCATE, fmt, ap); va_end(ap);
     SYSTEMTIME st; GetLocalTime(&st);
     char line[1200];
     int n = _snprintf_s(line, sizeof line, _TRUNCATE, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+    AcquireSRWLockExclusive(&g_logLock);
     HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w; WriteFile(h, line, (DWORD)(n > 0 ? n : 0), &w, nullptr);
         CloseHandle(h);
     }
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
 static void IniString(const char* section, const char* key, const char* def, char* out, DWORD size) {
@@ -116,6 +121,11 @@ static void LoadConfig() {
     g_cfg.right = _stricmp(trig, "L2") != 0;
     g_cfg.left  = _stricmp(trig, "L2") == 0 || _stricmp(trig, "Both") == 0;
     g_cfg.holdMs        = IniInt("General", "HoldMs", 2500);
+    g_cfg.aimReleaseMs  = IniInt("General", "AimReleaseMs", 150);
+    {
+        char buf[128]; IniString("General", "AimEffect", "weapon 3 6 5", buf, sizeof buf);
+        if (!ds::Parse(buf, g_cfg.aim)) { Log("WARN AimEffect=\"%s\" is invalid, using default", buf); ds::Parse("weapon 3 6 5", g_cfg.aim); }
+    }
     g_cfg.refreshMs     = IniInt("General", "RefreshMs", 400);
     g_cfg.muteUnfocused = IniInt("General", "MuteWhenUnfocused", 1) != 0;
     g_cfg.hotkeys       = IniInt("General", "TestHotkeys", 1) != 0;
@@ -136,13 +146,36 @@ static void LoadConfig() {
         IniString(kSection[i], "Kick", kDefaults[i].kick, buf, sizeof buf);
         if (!ds::Parse(buf, p.kick)) { Log("WARN [%s] Kick=\"%s\" is invalid, using default", kSection[i], buf); ds::Parse(kDefaults[i].kick, p.kick); }
         p.kickMs = IniInt(kSection[i], "KickMs", kDefaults[i].kickMs);
-        if (p.kickMs < 0) p.kickMs = 0; if (p.kickMs > 2000) p.kickMs = 2000;
+        p.kickMs = p.kickMs < 0 ? 0 : p.kickMs > 2000 ? 2000 : p.kickMs;
         IniString(kSection[i], "Rest", kDefaults[i].rest, buf, sizeof buf);
         if (!ds::Parse(buf, p.rest)) { Log("WARN [%s] Rest=\"%s\" is invalid, using default", kSection[i], buf); ds::Parse(kDefaults[i].rest, p.rest); }
+        IniString(kSection[i], "Haptic", "1.0", buf, sizeof buf);
+        p.haptic = atof(buf);
+        p.haptic = p.haptic < 0 ? 0 : p.haptic > 2 ? 2 : p.haptic;
     }
-    Log("config: enabled=%d trigger=%s hold=%dms id=%s offset=%d", g_cfg.enabled,
-        g_cfg.left && g_cfg.right ? "Both" : g_cfg.left ? "L2" : "R2", g_cfg.holdMs,
-        g_cfg.idMode == 0 ? "auto" : g_cfg.idMode == 1 ? "offset" : "off", g_cfg.idOffset);
+
+    InputConfig ic;
+    ic.remap         = IniInt("Input", "R2FiresWhileAiming", 1) != 0;
+    ic.fireThreshold = IniInt("Input", "R2FireThreshold", 170);
+    ic.fireThreshold = ic.fireThreshold < 20 ? 20 : ic.fireThreshold > 255 ? 255 : ic.fireThreshold;
+    ic.afterFireMs   = IniInt("Input", "AimAfterFireMs", 1500);
+    ic.timeoutMs     = IniInt("Input", "AimTimeoutMs", 20000);
+    ic.logInput      = IniInt("Input", "LogAim", 1) != 0;
+    Input_Configure(ic);
+
+    HapticConfig hc;
+    hc.enabled       = IniInt("Haptics", "Enabled", 1) != 0;
+    { char buf[32]; IniString("Haptics", "Gain", "1.0", buf, sizeof buf); hc.gain = atof(buf); }
+    hc.gain = hc.gain < 0 ? 0 : hc.gain > 2 ? 2 : hc.gain;
+    GetPrivateProfileStringW(L"Haptics", L"DeviceName", L"Wireless Controller", hc.deviceName, 128, g_ini);
+    hc.bufferMs      = IniInt("Haptics", "BufferMs", 10);
+    hc.leftChannel   = IniInt("Haptics", "LeftChannel", 2);
+    hc.rightChannel  = IniInt("Haptics", "RightChannel", 3);
+    hc.muteUnfocused = g_cfg.muteUnfocused;
+    Haptics_Configure(hc);
+    Log("config: enabled=%d trigger=%s id=%s offset=%d R2-fire=%d haptics=%d gain=%.2f", g_cfg.enabled,
+        g_cfg.left && g_cfg.right ? "Both" : g_cfg.left ? "L2" : "R2",
+        g_cfg.idMode == 0 ? "auto" : g_cfg.idMode == 1 ? "offset" : "off", g_cfg.idOffset, ic.remap, hc.enabled, hc.gain);
 }
 
 // ───────────────────────────── DualSense HID ─────────────────────────────
@@ -411,39 +444,65 @@ static int ScanAndHook() {
 }
 
 // The executable may still be packed when Reloaded-II starts us: poll until the code shows up.
+static int SafeScan() {
+    __try { return ScanAndHook(); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+static int SafeInputHooks() {
+    __try { return Input_InstallHooks(); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 static DWORD WINAPI HookThread(LPVOID) {
-    for (int i = 0; i < 240 && !g_quit.load(); ++i) {   // up to 2 minutes
-        int n = 0;
-        __try { n = ScanAndHook(); } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
-        if (n > 0) { Log("ready: %d hook(s). Fire a gun in battle.", n); return 0; }
-        Sleep(500);
+    bool shotHooked = false, gaveUp = false;
+    for (int i = 0; !g_quit.load(); ++i) {
+        if (!shotHooked && !gaveUp) {
+            int n = SafeScan();
+            if (n > 0) { shotHooked = true; Log("ready: %d shot hook(s). Fire a gun in battle.", n); }
+            else if (i >= 480) {   // ~2 minutes
+                gaveUp = true;
+                Log("ERROR: gun shot code not found (different game version, or another mod/cheat already patched it). Shots will not be felt.");
+            }
+        }
+        // The executable may restore its import table while it unpacks: keep our input hooks in place.
+        if (int n = SafeInputHooks()) Log("input: %d import slot(s) (re)hooked", n);
+        if (i == 120 && !Input_Seen()) Log("input: no pad read seen yet through XInput or DualSense HID (keep playing; if this stays, R2 fire is unavailable)");
+        Sleep(shotHooked ? 2000 : 250);
     }
-    if (!g_quit.load())
-        Log("ERROR: gun shot code not found (different game version, or another mod/cheat already patched it). Nothing will happen.");
     return 0;
 }
 
 // ───────────────────────────── worker ─────────────────────────────
-static bool GameFocused() {
+bool GameFocused() {
     HWND fg = GetForegroundWindow(); DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
 }
 
+// Trigger timeline:
+//   aim start ──► AimEffect ──► shot ──► Kick (KickMs) ──► Rest ──► aim end (+AimReleaseMs) ──► off
+// If the game's pad input was never seen (aiming unknown), Rest is held for HoldMs after the last shot.
 static DWORD WINAPI WorkerThread(LPVOID) {
-    enum { Idle, Kick, Rest } state = Idle;
+    enum { Idle, Aim, Kick, Rest } state = Idle;
     const Profile* cur = nullptr;
-    DWORD kickEnd = 0, restEnd = 0, lastSend = 0;
+    DWORD kickEnd = 0, restEnd = 0, lastSend = 0, aimEndAt = 0;
     uint32_t tail = 0;
     int testIdx = 0;
-    bool prevF9 = false, prevF10 = false;
+    bool prevF9 = false, prevF10 = false, wasAiming = false;
 
     SendEffect(ds::Off());   // clear anything left over
+
+    auto shot = [&](const Profile& p, int id, DWORD now) {
+        Haptics_Play(id, p.haptic);
+        cur = &p; state = Kick; kickEnd = now + p.kickMs; restEnd = now + p.kickMs + g_cfg.holdMs; aimEndAt = 0;
+        SendEffect(p.kick); lastSend = now;
+    };
 
     while (!g_quit.load()) {
         WaitForSingleObject(g_wake, 15);
         const DWORD now = GetTickCount();
         const bool focused = GameFocused();
+        const bool active = g_cfg.enabled && (focused || !g_cfg.muteUnfocused);
+        const bool aimKnown = Input_Seen();
+        const bool aiming = aimKnown && Input_Aiming();
 
         // 1) shots
         const uint32_t head = g_head.load(std::memory_order_acquire);
@@ -452,37 +511,43 @@ static DWORD WINAPI WorkerThread(LPVOID) {
             ShotRec& r = g_ring[tail % kRingSize];
             if (r.seq.load(std::memory_order_acquire) != tail + 1) break;  // still being written
             int id = Identify(r);
-            const Profile& p = g_profiles[id];
             if (g_cfg.logShots)
-                Log("SHOT unit=0x%llX bullets %u->%u shooter=%s", (unsigned long long)r.unit, r.bullets,
-                    r.bullets ? r.bullets - 1 : 0, id ? kSection[id] : "unknown (Default)");
-            if (g_cfg.enabled && (focused || !g_cfg.muteUnfocused)) {
-                cur = &p; state = Kick; kickEnd = now + p.kickMs; restEnd = now + p.kickMs + g_cfg.holdMs;
-                SendEffect(p.kick); lastSend = now;
-            }
+                Log("SHOT unit=0x%llX bullets %u->%u shooter=%s%s", (unsigned long long)r.unit, r.bullets,
+                    r.bullets ? r.bullets - 1 : 0, id ? kSection[id] : "unknown (Default)", aiming ? " (aiming)" : "");
+            if (active) shot(g_profiles[id], id, now);
             ++tail;
         }
 
-        // 2) test hotkeys: F9 = next character's effect, F10 = reload INI
+        // 2) aiming
+        if (aiming && !wasAiming) {
+            aimEndAt = 0;
+            if (active && state == Idle) { state = Aim; SendEffect(g_cfg.aim); lastSend = now; }
+        }
+        if (!aiming && wasAiming && state != Idle) aimEndAt = now + g_cfg.aimReleaseMs;
+        wasAiming = aiming;
+
+        // 3) test hotkeys: F9 = next character's effect, F10 = reload INI
         if (g_cfg.hotkeys && focused) {
             bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0, f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
             if (f9 && !prevF9) {
                 testIdx = testIdx % 10 + 1;
                 Log("TEST %s", kSection[testIdx]);
-                cur = &g_profiles[testIdx]; state = Kick;
-                kickEnd = now + cur->kickMs; restEnd = now + cur->kickMs + g_cfg.holdMs;
-                SendEffect(cur->kick); lastSend = now;
+                shot(g_profiles[testIdx], testIdx, now);
             }
             if (f10 && !prevF10) { LoadConfig(); Log("INI reloaded"); }
             prevF9 = f9; prevF10 = f10;
         }
 
-        // 3) timeline
-        if (state != Idle && g_cfg.muteUnfocused && !focused) { SendEffect(ds::Off()); state = Idle; cur = nullptr; }
+        // 4) timeline
+        if (state != Idle && !active) { SendEffect(ds::Off()); state = Idle; cur = nullptr; aimEndAt = 0; continue; }
         if (state == Kick && (int)(now - kickEnd) >= 0) { state = Rest; SendEffect(cur->rest); lastSend = now; }
-        if (state == Rest && (int)(now - restEnd) >= 0) { state = Idle; SendEffect(ds::Off()); cur = nullptr; }
+        const bool endByAim = aimEndAt && (int)(now - aimEndAt) >= 0;
+        const bool endByHold = state == Rest && !aiming && (int)(now - restEnd) >= 0;
+        if (state != Idle && state != Kick && (endByAim || endByHold)) {
+            state = Idle; cur = nullptr; aimEndAt = 0; SendEffect(ds::Off());
+        }
         if (state != Idle && g_cfg.refreshMs > 0 && now - lastSend >= (DWORD)g_cfg.refreshMs) {
-            SendEffect(state == Kick ? cur->kick : cur->rest); lastSend = now;
+            SendEffect(state == Aim ? g_cfg.aim : state == Kick ? cur->kick : cur->rest); lastSend = now;
         }
     }
     SendEffect(ds::Off());
@@ -503,16 +568,19 @@ static DWORD WINAPI InitThread(LPVOID) {
     Log("P5R Gun Adaptive Trigger " MOD_VERSION " starting");
     LoadConfig();
     if (!g_cfg.enabled) { Log("disabled in INI ([General] Enabled=0)"); return 0; }
-    g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_ioEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     CloseHandle(CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr));
     CloseHandle(CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr));
+    Haptics_Start();
     return 0;
 }
 
 extern "C" __declspec(dllexport) void ReloadedStart() {
     static std::atomic<bool> started{ false };
     if (started.exchange(true)) return;
+    g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    // Input hooks go in right away, before the game opens its controller (they are re-checked later).
+    Input_InstallHooks();
     CloseHandle(CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr));
 }
 

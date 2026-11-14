@@ -3,6 +3,7 @@
 // tests/check_stub.sh also disassembles the generated stub with objdump.
 #include "effects.h"
 #include "hookstub.h"
+#include "input.h"
 #include <cassert>
 #include <cstdio>
 
@@ -84,6 +85,77 @@ int main(int argc, char** argv) {
     size_t n = hook::BuildStub(stub, site, 0x1122334455667788ull, 0x14000100Bull);
     CHECK(n <= hook::kStubMax);
     if (argc > 1) { FILE* f = fopen(argv[1], "wb"); fwrite(stub, 1, n, f); fclose(f); }
+
+
+    // ── Aim tracker ──
+    {
+        using input::Pad;
+        input::AimTracker t;
+        uint32_t now = 1000;
+        Pad p;
+        CHECK(!t.Update(p, now));
+        p.r2 = 255; t.Update(p, now += 16);                 // R2 outside aiming: untouched (Baton Pass)
+        CHECK(!t.RemapR2() && !t.SwallowR2());
+        p.r2 = 0; t.Update(p, now += 16);
+        p.up = true; CHECK(t.Update(p, now += 16));          // D-pad Up: aiming
+        p.up = false; t.Update(p, now += 16);
+        p.r2 = 100; t.Update(p, now += 16); CHECK(!t.RemapR2());   // half pull: not yet
+        p.r2 = 200; t.Update(p, now += 16); CHECK(t.RemapR2());    // past the click: fire
+        p.r2 = 150; t.Update(p, now += 16); CHECK(t.RemapR2());    // hysteresis
+        p.r2 = 0; t.Update(p, now += 16); CHECK(!t.RemapR2() && t.Aiming());
+        t.Update(p, now += 1400); CHECK(t.Aiming());               // within AimAfterFireMs
+        t.Update(p, now += 200); CHECK(!t.Aiming());               // then it ends
+        // Circle cancels; R2 held across the end is swallowed until released
+        p.up = true; t.Update(p, now += 16); p.up = false; t.Update(p, now += 16);
+        p.r2 = 255; t.Update(p, now += 16); CHECK(t.RemapR2());
+        p.circle = true; t.Update(p, now += 16); CHECK(!t.Aiming() && !t.RemapR2() && t.SwallowR2());
+        p.circle = false; t.Update(p, now += 16); CHECK(t.SwallowR2());
+        p.r2 = 0; t.Update(p, now += 16); CHECK(!t.SwallowR2());
+        // Timeout
+        p.up = true; t.Update(p, now += 16); p.up = false; t.Update(p, now += 16);
+        t.Update(p, now += 20001); CHECK(!t.Aiming());
+        // Left/right (target select) keep it alive
+        p.up = true; t.Update(p, now += 16); p.up = false; t.Update(p, now += 16);
+        CHECK(t.Generation() > 0);
+    }
+
+    // ── XInput remap ──
+    {
+        input::XGamepad g{}; g.wButtons = input::X_UP; g.bRightTrigger = 200;
+        input::Pad p = input::FromXInput(g);
+        CHECK(p.up && p.r2 == 200 && !p.cross);
+        input::RemapXInput(g, true);
+        CHECK((g.wButtons & input::X_A) && g.bRightTrigger == 0);
+        input::XGamepad h{}; h.bRightTrigger = 99; input::RemapXInput(h, false);
+        CHECK(!(h.wButtons & input::X_A) && h.bRightTrigger == 0);
+    }
+
+    // ── DualSense input remap (USB, BT full, BT simple) ──
+    {
+        uint8_t usb[64] = { 0x01 }; usb[6] = 220; usb[8] = 0x00 /*hat N*/; usb[9] = 0x08 /*R2*/;
+        input::DsLayout l;
+        CHECK(input::DsLayoutFor(usb, 64, l));
+        input::Pad p = input::FromDualSense(usb, l);
+        CHECK(p.up && p.r2 == 220 && !p.cross);
+        input::RemapDualSense(usb, l, true);
+        CHECK((usb[8] & 0x20) && !(usb[9] & 0x08) && usb[6] == 0 && (usb[8] & 0x0F) == 0);
+
+        uint8_t bt[78] = { 0x31 }; bt[7] = 220; bt[9] = 0x08 /*hat none*/; bt[10] = 0x08;
+        CHECK(input::DsLayoutFor(bt, 78, l));
+        p = input::FromDualSense(bt, l);
+        CHECK(!p.up && p.r2 == 220);
+        input::RemapDualSense(bt, l, true);
+        CHECK((bt[9] & 0x20) && bt[7] == 0 && !(bt[10] & 0x08));
+        uint8_t seed = 0xA1; uint32_t c = ~input::Crc32(bt, 74, input::Crc32(&seed, 1)), got; memcpy(&got, bt + 74, 4);
+        CHECK(c == got);
+
+        uint8_t simple[10] = { 0x01 }; simple[5] = 0x23 /*cross + hat SE*/; simple[9] = 10;
+        CHECK(input::DsLayoutFor(simple, 10, l));
+        p = input::FromDualSense(simple, l);
+        CHECK(p.cross && p.down && p.right && p.r2 == 10);
+        uint8_t junk[64] = { 0x05 };
+        CHECK(!input::DsLayoutFor(junk, 64, l));
+    }
 
     printf(fails ? "%d test(s) FAILED\n" : "all tests passed\n", fails);
     return fails ? 1 : 0;
